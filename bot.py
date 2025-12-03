@@ -1,93 +1,107 @@
-import random
-import string
+import logging
 import json
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, CallbackContext
+import aiohttp
+from aiogram import Bot, Dispatcher, executor, types
 
-TOKEN = "8408011643:AAEbATOF3eldawdXyA5WCoTKqaCXafuoDXA"
-TARGET_CHAT_ID = -1002524076661   # chat_id твоей группы с МИНУСОМ!
-ADMIN_IDS = [516469420]        # твой user_id, без кавычек
+# ---- Вставь свой API token бота и id группы ----
+API_TOKEN = 'ВСТАВЬ_ТВОЙ_ТЕЛЕГРАМ_BOT_TOKEN'
+TELEGRAM_GROUP_ID = -1001234567890   # <-- сюда id твоей группы с минусом впереди
 
-CODES_FILE = "codes.json"
+# ---- Твои ключи от Zoom Marketplace ----
+ZOOM_ACCOUNT_ID = "KDaSi2vVRNKqPQKaqRqAzA"
+ZOOM_CLIENT_ID = "mvsumRr9SyekM1MZyXvyww"
+ZOOM_CLIENT_SECRET = "Ka9PKA0e2l872r3PViakZtcJSlOcR3PW"
+ZOOM_MEETING_ID = "87894049408"  # <-- должен быть ЦИФРОВОЙ, например 87894049408 (ПРОВЕРЬ через Zoom)
 
-def load_codes():
+# --- Имя файла для хранения связки user_id - join_url ---
+DB_FILE = "zoom_users.json"
+
+logging.basicConfig(level=logging.INFO)
+
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(bot)
+
+def load_db():
     try:
-        with open(CODES_FILE, "r") as f:
+        with open(DB_FILE, 'r') as f:
             return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+    except Exception:
         return {}
 
-def save_codes(codes):
-    with open(CODES_FILE, "w") as f:
-        json.dump(codes, f)
+def save_db(db):
+    with open(DB_FILE, 'w') as f:
+        json.dump(db, f)
 
-def generate_code(length=6):
-    chars = string.ascii_letters + string.digits
-    return ''.join(random.choices(chars, k=length))
+async def get_zoom_access_token():
+    url = f"https://zoom.us/oauth/token?grant_type=account_credentials&account_id={ZOOM_ACCOUNT_ID}"
+    headers = {
+        "Authorization": "Basic " + (
+            f"{ZOOM_CLIENT_ID}:{ZOOM_CLIENT_SECRET}"
+        ).encode("ascii").decode("ascii"),
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers) as resp:
+            data = await resp.json()
+            return data.get("access_token")
 
-def is_user_in_chat(bot, user_id):
+async def check_user_in_group(user_id):
     try:
-        member = bot.get_chat_member(TARGET_CHAT_ID, user_id)
-        print(f"Проверка пользователя {user_id}, статус: {member.status}")
-        return member.status in ("member", "administrator", "creator")
+        chat_member = await bot.get_chat_member(TELEGRAM_GROUP_ID, user_id)
+        return chat_member.status in ["member", "administrator", "creator"]
     except Exception as e:
-        print(f"Ошибка get_chat_member: {e}")
+        print('ошибка проверки группы:', e)
         return False
 
-def getcode(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    username = update.effective_user.username or ""
-    codes = load_codes()
+async def register_on_zoom(fullname, email):
+    token = await get_zoom_access_token()
+    url = f"https://api.zoom.us/v2/meetings/{ZOOM_MEETING_ID}/registrants"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "email": email,
+        "first_name": fullname,
+        "last_name": "",
+        # Zoom не всегда использует эти параметры, но оставим для совместимости
+        "auto_approve": True
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=payload) as resp:
+            data = await resp.json()
+            # print(data)
+            return data.get("join_url")
 
-    # Информационный вывод в консоль для диагностики:
-    print(f"Запрос кода. user_id: {user_id}, username: {username}")
+@dp.message_handler(commands=["zoom", "join"])
+async def process_zoom(message: types.Message):
+    tg_id = str(message.from_user.id)
+    db = load_db()
 
-    if is_user_in_chat(context.bot, user_id):
-        if str(user_id) in codes:
-            code = codes[str(user_id)]["code"]
-            update.message.reply_text(f"Ваш код уже был выдан раньше: {code}")
+    if tg_id in db:
+        await message.reply(f"Ваша индивидуальная ссылка для Zoom:\n{db[tg_id]}\nНЕ передавайте её другим.")
+        return
+
+    # Проверка участия в группе
+    in_group = await check_user_in_group(message.from_user.id)
+    if not in_group:
+        await message.reply("Извините, только для членов спец.чата.")
+        return
+
+    fullname = message.from_user.username or message.from_user.full_name or "TelegramUser"
+    email = f"tg_{tg_id}@bot.local"
+    try:
+        join_url = await register_on_zoom(fullname, email)
+        if join_url:
+            db[tg_id] = join_url
+            save_db(db)
+            await message.reply(f"Ваша индивидуальная ссылка на Zoom:\n{join_url}\nНЕ передавайте её другим.")
         else:
-            code = generate_code()
-            codes[str(user_id)] = {"code": code, "username": username}
-            save_codes(codes)
-            update.message.reply_text(f"Ваш уникальный код: {code}")
-    else:
-        update.message.reply_text("Вы не состоите в нужном чате или канале.")
-        print(f"Пользователь {user_id} не найден в группе!")
+            await message.reply("Не удалось получить ссылку Zoom. Обратитесь к админу.")
+    except Exception as e:
+        print(e)
+        await message.reply("Ошибка регистрации в Zoom. Сообщите админу.")
 
-def codes_command(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        update.message.reply_text("Нет доступа.")
-        return
-
-    codes = load_codes()
-    if not codes:
-        update.message.reply_text("Кодов еще не выдано.")
-        return
-
-    text = "Список выданных кодов:\n"
-    for uid, info in codes.items():
-        line = f"- @{info['username'] if info['username'] else uid}: {info['code']}"
-        text += line + "\n"
-    update.message.reply_text(text)
-
-# Диагностическая команда chatid
-def chatid(update: Update, context: CallbackContext):
-    update.message.reply_text(
-        f"chat_id этого чата: {update.effective_chat.id}\n"
-        f"Ваш user_id: {update.effective_user.id}"
-    )
-
-def main():
-    updater = Updater(TOKEN, use_context=True)
-    dp = updater.dispatcher
-    dp.add_handler(CommandHandler('getcode', getcode))
-    dp.add_handler(CommandHandler('codes', codes_command))
-    dp.add_handler(CommandHandler('chatid', chatid))
-    updater.start_polling()
-    print("Бот запущен! Нажмите Ctrl+C для остановки...")
-    updater.idle()
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    from aiogram import executor
+    executor.start_polling(dp, skip_updates=True)
